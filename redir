@@ -1,0 +1,192 @@
+#!/usr/bin/env perl
+use v5.36;
+use strict;
+use warnings;
+
+use Getopt::Long qw(GetOptions);
+use LWP::UserAgent;
+use HTTP::Request ();
+use URI ();
+use JSON::PP qw(encode_json);
+use IO::Socket::SSL ();   # for ssl_opts
+
+sub usage {
+  print STDERR <<"USAGE";
+Usage: redir [options] URL
+
+Options:
+  --insecure         Disable TLS certificate/hostname verification
+  --annotate         Show status code and redirect mechanism per hop
+  --json             Output JSON instead of text
+  --max N            Maximum hops (default 20)
+  --timeout S        Per-request timeout in seconds (default 20)
+  --method M         HTTP method to use for requests (default GET)
+                     NOTE: Soft redirect detection (meta refresh / JS) only works with GET.
+  --show-headers     Print response headers for each hop
+
+Examples:
+  redir "http://t.co/bhxnq1IJ"
+  redir --insecure --annotate --show-headers "http://t.co/bhxnq1IJ"
+  redir --method HEAD --annotate "https://example.com"
+USAGE
+  exit 2;
+}
+
+my ($insecure, $annotate, $as_json, $max_hops, $timeout, $method, $show_headers)
+  = (0, 0, 0, 20, 20, 'GET', 0);
+
+GetOptions(
+  'insecure!'     => \$insecure,
+  'annotate!'     => \$annotate,
+  'json!'         => \$as_json,
+  'max=i'         => \$max_hops,
+  'timeout=i'     => \$timeout,
+  'method=s'      => \$method,
+  'show-headers!' => \$show_headers,
+) or usage();
+
+my $start = shift // usage();
+
+$method = uc($method // 'GET');
+
+my %ssl_opts = $insecure
+  ? ( verify_hostname => 0, SSL_verify_mode => 0x00 )
+  : ();
+
+# env var affects older LWP hostname checks too
+$ENV{PERL_LWP_SSL_VERIFY_HOSTNAME} = $insecure ? 0 : 1;
+
+my $ua = LWP::UserAgent->new(
+  agent        => "redir/1.4",
+  timeout      => $timeout,
+  max_redirect => 0,               # follow manually
+  ssl_opts     => \%ssl_opts,
+);
+
+my @hops;
+my %seen;
+my $url = $start;
+my $cur_method = $method;
+
+HOP: for my $step (1..$max_hops) {
+  last if $seen{$url}++;
+
+  my %hop = ( url => $url, request_method => $cur_method );
+
+  my $req = HTTP::Request->new( $cur_method => $url );
+  my $res = $ua->request( $req );
+
+  $hop{status}  = $res->code;
+  $hop{reason}  = $res->message // '';
+  $hop{via}     = undef;
+
+  # Capture headers if requested
+  if ($show_headers) {
+    # Build a simple "header: value" string block
+    my $hdr_str = "HTTP/" . ($res->protocol // '1.1') . " $hop{status} $hop{reason}\n";
+    $hdr_str   .= $res->headers_as_string("\n");
+    $hop{headers} = $hdr_str;
+  }
+
+  # 1) Hard redirect via Location
+  if ( $res->is_redirect ) {
+    $hop{via} = 'http';
+    my $loc = $res->header('Location') // do {
+      push @hops, \%hop; last;
+    };
+    my $abs = URI->new_abs($loc, $url)->as_string;
+
+    # RFC 7231: 303 -> GET; others usually keep method (we're not dealing with POST here)
+    my $next_method = $cur_method;
+    $next_method = 'GET' if $res->code == 303;
+
+    push @hops, \%hop;
+    $url        = $abs;
+    $cur_method = $next_method;
+    next HOP;
+  }
+
+  # If not GET, we can’t inspect body for soft redirects
+  my $can_soft = ($cur_method eq 'GET');
+
+  # 2) Refresh header (e.g. "0; url=https://…")
+  if ( my $refresh = $res->header('Refresh') ) {
+    if ( $refresh =~ /url\s*=\s*([^;]+)/i ) {
+      $hop{via} = 'refresh-header';
+      push @hops, \%hop;
+      $url        = URI->new_abs($1, $url)->as_string;
+      $cur_method = 'GET';  # follow-ups via GET
+      next HOP;
+    }
+  }
+
+  # 3) HTML meta refresh or simple JS redirects (GET only)
+  if ( $can_soft && ($res->header('Content-Type') // '') =~ m{text/html}i ) {
+    my $html = $res->decoded_content // '';
+
+    # meta refresh with quoted content
+    if ( $html =~ m{
+          <meta\b[^>]*http-equiv\s*=\s*["']?refresh["']?
+          [^>]*content\s*=\s*["'][^"']*?\burl\s*=\s*([^"'>\s]+)["']
+        }ix ) {
+      $hop{via} = 'meta-refresh';
+      push @hops, \%hop;
+      $url        = URI->new_abs($1, $url)->as_string;
+      $cur_method = 'GET';
+      next HOP;
+    }
+
+    # meta refresh with unquoted content
+    if ( $html =~ m{
+          <meta\b[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*content\s*=\s*([^"'>]+)>
+        }ix ) {
+      my $content = $1;
+      if ( $content =~ /\burl\s*=\s*([^;\s]+)/i ) {
+        $hop{via} = 'meta-refresh';
+        push @hops, \%hop;
+        $url        = URI->new_abs($1, $url)->as_string;
+        $cur_method = 'GET';
+        next HOP;
+      }
+    }
+
+    # simple JS redirects
+    if ( $html =~ m{(?:window\.)?location(?:\.href|\.assign|\.replace)?\s*=\s*["']([^"']+)["']}i ) {
+      $hop{via} = 'javascript';
+      push @hops, \%hop;
+      $url        = URI->new_abs($1, $url)->as_string;
+      $cur_method = 'GET';
+      next HOP;
+    }
+  }
+
+  # terminal
+  push @hops, \%hop;
+  last;
+}
+
+# Output
+if ($as_json) {
+  # If --show-headers was used, include headers strings; otherwise omit for brevity
+  print encode_json({ chain => \@hops }), "\n";
+  exit 0;
+}
+
+for my $i (0..$#hops) {
+  my $h = $hops[$i];
+  my $line = sprintf "%d. %s", $i+1, $h->{url};
+  if ($annotate) {
+    my $via = $h->{via} // 'final';
+    $line .= sprintf "  [%s %s]", ($h->{status} // '?'), $via;
+    $line .= sprintf "  {%s}", $h->{request_method} if $h->{request_method};
+  }
+  print "$line\n";
+
+  if ($show_headers && defined $h->{headers}) {
+    # Indent headers for readability
+    my $hdr = $h->{headers};
+    $hdr =~ s/^/    /mg;
+    print "$hdr\n";
+  }
+}
+
